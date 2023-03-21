@@ -11,6 +11,7 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_SSD1306.h>
 #include <DFRobotDFPlayerMini.h>
+#include <IoTTimer.h>
 #include <Adafruit_MQTT.h>
 #include <Adafruit_MQTT/Adafruit_MQTT_SPARK.h>
 #include <Adafruit_MQTT/Adafruit_MQTT.h>
@@ -23,35 +24,52 @@ const int OLED_RESET = D2;
 const int LEDPIN = D3;
 const int PUMPPIN = D5;
 const int DUSTPIN = D6;
-const int MOISTPIN = A2;
+const int TONEPIN = A3;
+const int PLANTPIN = A1;
+const int SOILMOISTPIN = A2;
 const int AQPIN = A4;
+const int sampleTime = 30000;
+
+static unsigned int duration, lowPulseOccupancy;
+
+int startTime, soilMoisture;
+bool waterButtonState;
+float airQuality, temp, concentration, ratio, subValue;
 
 TCPClient TheClient;
 
-SoftwareSerial mySoftwareSerial(10, 9); // RX, TX
 DFRobotDFPlayerMini plantMp3Player;
 AirQualitySensor plantAirQuality(AQPIN);
 Adafruit_BME280 plantBme;
 Adafruit_SSD1306 plantDisplay(OLED_RESET);
 Adafruit_MQTT_SPARK mqtt(&TheClient,AIO_SERVER,AIO_SERVERPORT,AIO_USERNAME,AIO_KEY);
+IoTTimer waterTimer;
 
+Adafruit_MQTT_Subscribe waterButtonFeed = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/waterButton"); 
 Adafruit_MQTT_Publish airQualityFeed = Adafruit_MQTT_Publish(&mqtt,AIO_USERNAME "/feeds/airQuality");
 Adafruit_MQTT_Publish dustFeed = Adafruit_MQTT_Publish(&mqtt,AIO_USERNAME "/feeds/dustLevel");
 
-void checkEnvironment();
-void waterPlant();
 void plantMood(float _airQuality, float _concentration, float _plantReading);
 void MQTT_connect();
 bool MQTT_ping();
 
 SYSTEM_MODE(SEMI_AUTOMATIC);
 
-
 void setup() {
 
     Wire.begin();
+    Serial1.begin(9600);
     Serial.begin(9600);
+    
     waitFor(Serial.isConnected, 10000);
+
+    plantMp3Player.begin(Serial1);
+    plantMp3Player.outputDevice(DFPLAYER_DEVICE_SD);
+
+    WiFi.on();
+    WiFi.connect();
+
+    mqtt.subscribe(&waterButtonFeed);
 
     plantAirQuality.init();
     plantBme.begin(BMEADDRESS);
@@ -61,27 +79,37 @@ void setup() {
     plantDisplay.clearDisplay();
     plantDisplay.display();
 
-    //PINMODES HERE:
+    pinMode(TONEPIN,OUTPUT);
+    pinMode(PUMPPIN,OUTPUT);
+    pinMode(LEDPIN,OUTPUT);
+    pinMode(PLANTPIN,INPUT);
+    pinMode(DUSTPIN,INPUT);
+    pinMode(AQPIN,INPUT);
+    pinMode(SOILMOISTPIN,INPUT);
+
+    startTime = millis();
 
 }
 
 void loop() {
 
-    MQTT_connect();
-    checkEnvironment();
-    MQTT_ping();
+  MQTT_connect();
+  MQTT_ping();
 
-}
+  //pulled this code from Subscribe Publish, not totally sure on it??
+  Adafruit_MQTT_Subscribe *subscription;
+  while ((subscription = mqtt.readSubscription(100))) {
+    if (subscription == &waterButtonFeed) {
+      subValue = atoi((char *)waterButtonFeed.lastread);
+    }
+  }
 
-//check ambient temperature, air quality, and dust level
-void checkEnvironment() {
+  waterButtonState = subValue;
 
-  static int startTime;
-  const int sampleTime = 30000;
+  duration = pulseIn(DUSTPIN, LOW);
+  lowPulseOccupancy = lowPulseOccupancy + duration;
 
-  float ratio, concentration, airQuality;
-
-  //Read air quality and dust sensors and print to serial monitor every 30 seconds
+  //Read air quality and dust sensors and print to serial monitor / send to adafruit desktop every 30 s
   if(millis()-startTime > sampleTime){
 
     airQuality = plantAirQuality.getValue();
@@ -97,39 +125,76 @@ void checkEnvironment() {
     lowPulseOccupancy = 0;
     startTime = millis();
 
-    plantMood(airQuality, concentration);
+    //check soil moisture
+    soilMoisture = analogRead(SOILMOISTPIN);
+    Serial.printf("Soil moisture: %i\n", soilMoisture);
+
+    if(soilMoisture > 3000 ){ 
+      digitalWrite(PUMPPIN,HIGH);
+      Serial.printf("pumping!!\n");
+      waterTimer.startTimer(500);
 
   }
 
-  waterPlant();
+    //display env data to OLED
+  }
+    
+  plantMood(airQuality, concentration, soilMoisture);
+
+
+
+  if(waterButtonState){
+    digitalWrite(PUMPPIN,HIGH);
+    Serial.printf("button received\n");
+    waterTimer.startTimer(500);
+  }
+
+  if(waterTimer.isTimerReady()){
+    digitalWrite(PUMPPIN,LOW);
+  }
 
 }
 
-//water the plant either through soil moisture readings or with button on Adafruit desktop
-void waterPlant();
-
 //check the plant's mood using impedence sensors and environmental data
-void plantMood(float _airQuality, float _concentration){
+void plantMood(float _airQuality, float _concentration, float _soilMoisture){
 
   int plantReading;
   int ledBrightness;
+  int toneVal;
   int trackNum;
   int volume;
 
-//create several switch cases based on environment
+//play tones no matter what then:
 
-//create several switch cases based on plant "mood" from plant reading
+plantMp3Player.volume(30);
+plantMp3Player.play(1);
+plantReading = analogRead(PLANTPIN);
+tone(TONEPIN,plantReading,10000);
 
-  plantMp3Player.volume(volume);  //Set volume value. From 0 to 30
-  plantMp3Player.play(trackNum);  //Play the mp3 num
-  digitalWrite(LEDPIN, ledBrightness);
+//create several switch cases based on environment && plant mood ? (I think I did it with ONE if/else...but we'll see)
+//choose MP3 set "happy" "bad" or "neutral"
+//print to OLED
+//create a timer that waits a random amount of time before speaking
+
+  //toneVal = read the tonepin
+  //tone(toneVal,1000);
+
+  // if(_airQuality > 100|| _concentration > 10000 || _soilMoisture < 30000){            ||room is too cold 
+  //  plantMp3Player.setVolume(30);
+  //   plantMp3Player.playFolderTrack(1,random(1,random(8,25))); //Play mp3 from NEUTRAL and BAD states
+  //   digitalWrite(LEDPIN,ledBrightness); //turn on LED when plant is speaking
+  // }
+
+  // //plant's default state is happy, unless something about its environment is bothering it
+  // else{
+  //   plantMp3Player.setVolume(30);
+  //   plantMp3Player.playFolderTrack(1,random(1,20));  //Play mp3 from GOOD and NEUTRAL states
+  // }
 
 }
 
-// void MQTT_publish() {
 
-// }
-
+//Brian's MQTT functions
 void MQTT_connect() {
   int8_t ret;
  
