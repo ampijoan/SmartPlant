@@ -44,10 +44,13 @@ Adafruit_BME280 plantBme;
 Adafruit_SSD1306 plantDisplay(OLED_RESET);
 Adafruit_MQTT_SPARK mqtt(&TheClient,AIO_SERVER,AIO_SERVERPORT,AIO_USERNAME,AIO_KEY);
 IoTTimer waterTimer;
+IoTTimer plantSpeakTimer;
 
 Adafruit_MQTT_Subscribe waterButtonFeed = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/waterButton"); 
 Adafruit_MQTT_Publish airQualityFeed = Adafruit_MQTT_Publish(&mqtt,AIO_USERNAME "/feeds/airQuality");
 Adafruit_MQTT_Publish dustFeed = Adafruit_MQTT_Publish(&mqtt,AIO_USERNAME "/feeds/dustLevel");
+Adafruit_MQTT_Publish tempFeed = Adafruit_MQTT_Publish(&mqtt,AIO_USERNAME "/feeds/roomTemp");
+Adafruit_MQTT_Publish needsWaterFeed = Adafruit_MQTT_Publish(&mqtt,AIO_USERNAME "/feeds/needsWater");
 
 void plantMood(float _airQuality, float _concentration, float _plantReading);
 void MQTT_connect();
@@ -63,13 +66,13 @@ void setup() {
     
     waitFor(Serial.isConnected, 10000);
 
-    plantMp3Player.begin(Serial1);
-    plantMp3Player.outputDevice(DFPLAYER_DEVICE_SD);
-
     WiFi.on();
     WiFi.connect();
 
     mqtt.subscribe(&waterButtonFeed);
+
+    plantMp3Player.begin(Serial1);
+    plantMp3Player.outputDevice(DFPLAYER_DEVICE_SD);
 
     plantAirQuality.init();
     plantBme.begin(BMEADDRESS);
@@ -96,7 +99,7 @@ void loop() {
   MQTT_connect();
   MQTT_ping();
 
-  //pulled this code from Subscribe Publish, not totally sure on it??
+  //Using button on Adafruit dashboard to water plant
   Adafruit_MQTT_Subscribe *subscription;
   while ((subscription = mqtt.readSubscription(100))) {
     if (subscription == &waterButtonFeed) {
@@ -105,43 +108,6 @@ void loop() {
   }
 
   waterButtonState = subValue;
-
-  duration = pulseIn(DUSTPIN, LOW);
-  lowPulseOccupancy = lowPulseOccupancy + duration;
-
-  //Read air quality and dust sensors and print to serial monitor / send to adafruit desktop every 30 s
-  if(millis()-startTime > sampleTime){
-
-    airQuality = plantAirQuality.getValue();
-    Serial.printf("Air Quality: %f\n", airQuality);
-    airQualityFeed.publish(airQuality);
-
-    ratio = lowPulseOccupancy/(sampleTime*10.0); //int percent from 0-100
-    concentration = 1.1*pow(ratio,3)-3.8*pow(ratio,2)+520*ratio+0.62;
-
-    // Serial.printf("%i, %f, %f\n\n", lowPulseOccupancy, ratio, concentration);
-    Serial.printf("Dust level: %f\n", concentration);
-    dustFeed.publish(concentration);
-    lowPulseOccupancy = 0;
-    startTime = millis();
-
-    //check soil moisture
-    soilMoisture = analogRead(SOILMOISTPIN);
-    Serial.printf("Soil moisture: %i\n", soilMoisture);
-
-    if(soilMoisture > 3000 ){ 
-      digitalWrite(PUMPPIN,HIGH);
-      Serial.printf("pumping!!\n");
-      waterTimer.startTimer(500);
-
-  }
-
-    //display env data to OLED
-  }
-    
-  plantMood(airQuality, concentration, soilMoisture);
-
-
 
   if(waterButtonState){
     digitalWrite(PUMPPIN,HIGH);
@@ -153,43 +119,96 @@ void loop() {
     digitalWrite(PUMPPIN,LOW);
   }
 
+  duration = pulseIn(DUSTPIN, LOW);
+  lowPulseOccupancy = lowPulseOccupancy + duration;
+
+  //Read air quality and dust sensors and print to serial monitor / send to adafruit desktop every 30 s
+  if(millis()-startTime > sampleTime){
+
+    temp = (plantBme.readTemperature() * 1.8) + 32;
+    tempFeed.publish(temp);
+    // Serial.printf("Temperature: %f\n",temp);
+
+    airQuality = plantAirQuality.getValue();
+    // Serial.printf("Air Quality: %f\n", airQuality);
+    airQualityFeed.publish(airQuality);
+
+    ratio = lowPulseOccupancy/(sampleTime*10.0); //int percent from 0-100
+    concentration = 1.1*pow(ratio,3)-3.8*pow(ratio,2)+520*ratio+0.62;
+    // Serial.printf("Dust level: %f\n", concentration);
+    dustFeed.publish(concentration);
+    lowPulseOccupancy = 0;
+    startTime = millis();
+
+    //check soil moisture
+    soilMoisture = analogRead(SOILMOISTPIN);
+    needsWaterFeed.publish(soilMoisture);
+    // Serial.printf("Soil moisture: %i\n", soilMoisture);
+
+    if(soilMoisture > 3000 ){ 
+      digitalWrite(PUMPPIN,HIGH);
+      // Serial.printf("pumping!!\n");
+      waterTimer.startTimer(500);
+    }
+
+    //print environmental data to the OLED
+    plantDisplay.clearDisplay();
+    plantDisplay.display();
+    plantDisplay.setTextColor(WHITE);
+    plantDisplay.setTextSize(1);
+    plantDisplay.setCursor(0,0);
+    plantDisplay.printf("\nT: %.2f\nDust: %.2f\nAQ: %.2f\nSoil Moisture: %i",temp,concentration,airQuality,soilMoisture);
+    plantDisplay.display();
+
+  }
+
+  plantMood(airQuality, concentration, soilMoisture);
+
 }
 
-//check the plant's mood using impedence sensors and environmental data
+//check the plant's mood using impedence sensors and environmental data and play sounds depending on plant's "mood"
 void plantMood(float _airQuality, float _concentration, float _soilMoisture){
 
-  int plantReading;
-  int ledBrightness;
-  int toneVal;
-  int trackNum;
-  int volume;
+  int plantReading, trackId;
+  static bool speechToggle = true;
+  static int plantSpeakWait;
 
-//play tones no matter what then:
+  //play tones based on impedence reading no matter what
+  plantReading = analogRead(PLANTPIN);
+  tone(TONEPIN,plantReading,10000);
 
-plantMp3Player.volume(30);
-plantMp3Player.play(1);
-plantReading = analogRead(PLANTPIN);
-tone(TONEPIN,plantReading,10000);
+  if(speechToggle){
+    plantSpeakWait = random(500,3000);
+    plantSpeakTimer.startTimer(plantSpeakWait);
+    speechToggle = false;
+    digitalWrite(LEDPIN,LOW);
+  }
 
-//create several switch cases based on environment && plant mood ? (I think I did it with ONE if/else...but we'll see)
-//choose MP3 set "happy" "bad" or "neutral"
-//print to OLED
-//create a timer that waits a random amount of time before speaking
+  //if one of these values is "bad", the plant is unhappy
+  if (plantSpeakTimer.isTimerReady()){
+    if(_airQuality > 100|| _soilMoisture > 3000 || temp < 32){    //_concentration > 10000 |
+      plantMp3Player.volume(20);
+      trackId = random(4,10);
+      plantMp3Player.play(trackId); //Pick an mp3 from NEUTRAL and BAD states
+      digitalWrite(LEDPIN,HIGH); //turn on LED when plant is speaking
+      speechToggle = true;
+      Serial.printf("%i\n",trackId);
+  }
 
-  //toneVal = read the tonepin
-  //tone(toneVal,1000);
+    // //plant's default state is happy, unless something about its environment is bothering it
+    else{
+      plantMp3Player.volume(20);
+      trackId = random(1,7); //Pick mp3 an from GOOD and NEUTRAL states
+      plantMp3Player.play(trackId); 
+      digitalWrite(LEDPIN,HIGH); //turn on LED when plant is speaking 
+      speechToggle = true;
+      Serial.printf("%i\n",trackId);
 
-  // if(_airQuality > 100|| _concentration > 10000 || _soilMoisture < 30000){            ||room is too cold 
-  //  plantMp3Player.setVolume(30);
-  //   plantMp3Player.playFolderTrack(1,random(1,random(8,25))); //Play mp3 from NEUTRAL and BAD states
-  //   digitalWrite(LEDPIN,ledBrightness); //turn on LED when plant is speaking
-  // }
+    }
 
-  // //plant's default state is happy, unless something about its environment is bothering it
-  // else{
-  //   plantMp3Player.setVolume(30);
-  //   plantMp3Player.playFolderTrack(1,random(1,20));  //Play mp3 from GOOD and NEUTRAL states
-  // }
+  }
+
+    //print something to OLED, probably bitmaps
 
 }
 
